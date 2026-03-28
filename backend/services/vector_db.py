@@ -8,7 +8,9 @@ class VectorService:
     def __init__(self):
         # Using local Qdrant for a "professional but ready-to-use" setup
         # For cloud, use url and api_key from os.getenv
-        self.client = QdrantClient(":memory:")  # Temporary in-memory for professional demo
+        # Use persistent local storage so data is NOT lost after restarting
+        db_path = os.path.join(os.path.dirname(__file__), "..", "qdrant_storage")
+        self.client = QdrantClient(path=db_path) 
         self.collection_name = "candidates"
         
         # Initialize collection
