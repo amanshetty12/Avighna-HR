@@ -2,6 +2,7 @@ import os
 import json
 import base64
 import google.generativeai as genai
+from groq import AsyncGroq
 from typing import List, Dict, Any, Optional
 from dotenv import load_dotenv
 
@@ -11,30 +12,39 @@ load_dotenv()
 class LLMService:
     def __init__(self):
         gemini_key = os.getenv("GEMINI_API_KEY")
+        groq_key = os.getenv("GROQ_API_KEY")
         
-        self.client = None
+        self.gemini_model = None
         if gemini_key:
             genai.configure(api_key=gemini_key)
-            self.model = genai.GenerativeModel("gemini-1.5-flash")
+            # Keeping Gemini only for possible fallback or embeddings if needed
+        
+        self.groq_client = None
+        if groq_key:
+            self.groq_client = AsyncGroq(api_key=groq_key)
 
-    async def generate_response(self, prompt: str, model: str = "gemini-1.5-flash") -> str:
-        """Generic method to generate response from LLM."""
+    async def generate_response(self, prompt: str, model: str = "llama-3.3-70b-specdec") -> str:
+        """Generic method to generate response from Groq."""
         try:
-            # We standardize on gemini-1.5-flash for speed
-            response = await self.model.generate_content_async(prompt)
-            return response.text
+            if not self.groq_client:
+                return "Groq Client not initialized. Check API Key."
+            
+            chat_completion = await self.groq_client.chat.completions.create(
+                messages=[{"role": "user", "content": prompt}],
+                model=model,
+            )
+            return chat_completion.choices[0].message.content
         except Exception as e:
             return f"Error with {model}: {str(e)}"
 
     async def get_embedding(self, text: str) -> List[float]:
-        """Generate embeddings using Gemini (Threaded to avoid blocking)."""
+        """Generate embeddings using Gemini (Threaded)."""
         import asyncio
         import time
         try:
             if not os.getenv("GEMINI_API_KEY"):
                 return [0.0] * 768
             
-            # Use to_thread because embed_content is a blocking network call
             start = time.time()
             result = await asyncio.to_thread(
                 genai.embed_content,
@@ -48,10 +58,10 @@ class LLMService:
             print(f"Embedding error: {e}")
             return [0.0] * 768
 
-    async def analyze_cv_and_compare(self, cv_source: Any, jd_text: str, is_file: bool = False) -> Dict[str, Any]:
+    async def analyze_cv_and_compare(self, cv_text: str, jd_text: str) -> Dict[str, Any]:
         """
-        Consolidated method to extract CV data and compare it against JD in ONE call.
-        Supports both raw text and PDF file paths.
+        Consolidated method using Groq for extraction and comparison.
+        This uses raw text as Groq does not support native PDF.
         """
         import time
         start_all = time.time()
@@ -64,6 +74,9 @@ class LLMService:
 
         JD:
         {jd_text}
+
+        CV TEXT:
+        {cv_text}
 
         OUTPUT FORMAT (Return ONLY raw JSON):
         {{
@@ -85,21 +98,9 @@ class LLMService:
         """
 
         try:
-            if is_file and cv_source.endswith(".pdf"):
-                print(f"DEBUG: Starting Native PDF Analysis for {cv_source}...")
-                with open(cv_source, "rb") as f:
-                    pdf_data = base64.b64encode(f.read()).decode("utf-8")
-                
-                response = await self.model.generate_content_async([
-                    {"mime_type": "application/pdf", "data": pdf_data},
-                    prompt
-                ])
-            else:
-                print("DEBUG: Starting Text-based Analysis...")
-                response = await self.model.generate_content_async(f"{prompt}\n\nCV TEXT:\n{cv_source}")
-            
-            response_text = response.text
-            print(f"DEBUG: LLM Analysis complete in {time.time() - start_all:.2f}s")
+            print("DEBUG: Starting Groq Analysis...")
+            response_text = await self.generate_response(prompt)
+            print(f"DEBUG: Groq Analysis complete in {time.time() - start_all:.2f}s")
             
             import re
             match = re.search(r'\{.*\}', response_text, re.DOTALL)

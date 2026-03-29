@@ -23,27 +23,22 @@ async def upload_cv(
         f.write(await file.read())
     
     try:
-        # 1. Fast Parse (DOCX) or Get Path (PDF)
-        cv_source = await cv_parser.parse_document(temp_path)
+        # 1. Fast Local Parse for ALL types
         is_pdf = file.filename.endswith(".pdf")
         
-        # 2. Parallel LLM Analysis and Embedding
-        # If it's a PDF, cv_source is the path. If DOCX, it's the text.
-        print(f"DEBUG: Starting Parallel Analysis for {file.filename}...")
-        
-        # Define tasks for parallel execution
-        analysis_task = llm_service.analyze_cv_and_compare(cv_source, jd_text or "", is_file=is_pdf)
-        
-        # For embedding, we need text. Use pymupdf for PDF text extraction (fast)
-        embedding_text = ""
         if is_pdf:
             import fitz
             doc = fitz.open(temp_path)
-            embedding_text = "".join([page.get_text() for page in doc])[:5000]
+            cv_text = "".join([page.get_text() for page in doc])
         else:
-            embedding_text = cv_source[:5000]
-
-        embedding_task = llm_service.get_embedding(embedding_text)
+            cv_text = await cv_parser.parse_document(temp_path)
+        
+        # 2. Parallel LLM Analysis and Embedding
+        print(f"DEBUG: Starting Parallel Analysis for {file.filename}...")
+        
+        # Define tasks for parallel execution
+        analysis_task = llm_service.analyze_cv_and_compare(cv_text, jd_text or "")
+        embedding_task = llm_service.get_embedding(cv_text[:5000]) # Limit for embedding
         
         # Run both in parallel
         analysis_result, embedding = await asyncio.gather(analysis_task, embedding_task)
