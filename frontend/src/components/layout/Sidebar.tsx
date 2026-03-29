@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { NavLink } from 'react-router-dom';
-import { Home, Users, MessageSquare, ClipboardCheck, LayoutDashboard, Settings, Menu, X } from 'lucide-react';
+import { Home, Users, MessageSquare, ClipboardCheck, LayoutDashboard, Settings, Menu, X, BarChart3 } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 
@@ -71,6 +71,7 @@ const Sidebar = () => {
           <NavItem to="/candidates" icon={Users} label="Candidates" onClick={() => setIsOpen(false)} />
           <NavItem to="/interview" icon={MessageSquare} label="Copilot" onClick={() => setIsOpen(false)} />
           <NavItem to="/cultural-fit" icon={Home} label="Culture" onClick={() => setIsOpen(false)} />
+          <NavItem to="/kpi" icon={BarChart3} label="KPI" onClick={() => setIsOpen(false)} />
           <div className="mt-8 pt-8 border-t border-border">
             <NavItem to="/settings" icon={Settings} label="Settings" onClick={() => setIsOpen(false)} />
           </div>

@@ -5,6 +5,7 @@ import JDRefiner from './pages/JDRefiner';
 import Candidates from './pages/Candidates';
 import InterviewCopilot from './pages/InterviewCopilot';
 import CulturalFit from './pages/CulturalFit';
+import KPI from './pages/KPI';
 
 function App() {
   return (
@@ -33,6 +34,7 @@ function App() {
               <Route path="/candidates" element={<Candidates />} />
               <Route path="/interview" element={<InterviewCopilot />} />
               <Route path="/cultural-fit" element={<CulturalFit />} />
+              <Route path="/kpi" element={<KPI />} />
             </Routes>
           </div>
         </main>
