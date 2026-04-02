@@ -1,11 +1,12 @@
 import { useState, useEffect, useRef } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { Terminal, Play, ShieldCheck, Brain, Link, UserCheck, Loader2 } from 'lucide-react';
+import { Terminal, Play, ShieldCheck, Brain, Link, UserCheck, Loader2, Radio } from 'lucide-react';
 import axios from 'axios';
 
 interface TranscriptLine {
   role: 'INT' | 'CAN';
   text: string;
+  isFinal?: boolean;
 }
 
 interface Match {
@@ -15,47 +16,51 @@ interface Match {
   linkedinUrl: string;
   snippet: string;
   confirmed?: boolean;
-  isSearching?: boolean;
 }
 
 const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:8000';
+const DEEPGRAM_KEY = import.meta.env.VITE_DEEPGRAM_API_KEY;
 
 const InterviewCopilot = () => {
   const [isRecording, setIsRecording] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
   const [transcript, setTranscript] = useState<TranscriptLine[]>([]);
+  const [interimText, setInterimText] = useState("");
   const [matches, setMatches] = useState<Match[]>([]);
   const [status, setStatus] = useState('Neural Copilot Ready');
   
+  const isRecordingRef = useRef(false);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const deepgramSocketRef = useRef<WebSocket | null>(null);
   const transcriptEndRef = useRef<HTMLDivElement>(null);
   const chunksRef = useRef<Blob[]>([]);
   const intervalRef = useRef<any>(null);
 
   useEffect(() => {
     transcriptEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [transcript]);
+  }, [transcript, interimText]);
 
-  const isRecordingRef = useRef(false);
-
-  const processChunk = async (audioBlob: Blob) => {
+  const processWhisperChunk = async (audioBlob: Blob) => {
     if (audioBlob.size < 1000) return; 
     
     setIsProcessing(true);
-    setStatus('Analyzing Neural Audio...');
     const formData = new FormData();
     formData.append('file', audioBlob, 'chunk.webm');
 
     try {
+      // Whisper-v3-Turbo for "Gold Standard" Transcript
       const transRes = await axios.post(`${API_BASE}/interview/transcribe`, formData);
-      const newText = transRes.data.transcript;
+      const goldText = transRes.data.transcript;
       
-      if (newText && newText.trim().length > 2) {
-        setTranscript(prev => [...prev, { role: 'CAN', text: newText }]);
-        setStatus('Scanning for Professional Entities...');
-        const extractRes = await axios.post(`${API_BASE}/interview/analyze-stream?text=${encodeURIComponent(newText)}`);
+      if (goldText && goldText.trim().length > 2) {
+        // Clear interim text as we now have "Gold" text for this segment
+        setInterimText(""); 
+        setTranscript(prev => [...prev, { role: 'CAN', text: goldText, isFinal: true }]);
         
+        // Trigger Analysis on the Gold Text
+        const extractRes = await axios.post(`${API_BASE}/interview/analyze-stream?text=${encodeURIComponent(goldText)}`);
         const newEntities = extractRes.data.entities;
+        
         if (newEntities && newEntities.length > 0) {
             newEntities.forEach((ent: any) => {
               const match = ent.matches[0];
@@ -70,33 +75,53 @@ const InterviewCopilot = () => {
                 }]);
               }
             });
-            setStatus('Network Entity Identified!');
-        } else {
-            setStatus('No entities detected in this segment.');
+            setStatus('Network match identified.');
         }
       }
     } catch (e) {
-      console.error("Processing error", e);
-      setStatus('Processing Error. Backend down?');
+      console.error("Whisper error", e);
     } finally {
       setIsProcessing(false);
-      if (isRecordingRef.current) setStatus('Listening for cues...');
     }
   };
 
   const startCopilot = async () => {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      const mediaRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm' });
       
+      // 1. Setup Deepgram Nova-2 for Live Real-time Text
+      if (DEEPGRAM_KEY) {
+        const socket = new WebSocket('wss://api.deepgram.com/v1/listen?model=nova-2&smart_format=true', [
+            'token',
+            DEEPGRAM_KEY,
+        ]);
+
+        socket.onopen = () => console.log("Deepgram Live Stream Active");
+        socket.onmessage = (message) => {
+            const data = JSON.parse(message.data);
+            const transcript = data.channel?.alternatives[0]?.transcript;
+            if (transcript) {
+                setInterimText(prev => prev + " " + transcript);
+            }
+        };
+        deepgramSocketRef.current = socket;
+      }
+
+      // 2. Setup MediaRecorder for Chunked Whisper Processing
+      const mediaRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm' });
       mediaRecorder.ondataavailable = (e) => {
-        if (e.data.size > 0) chunksRef.current.push(e.data);
+        if (e.data.size > 0) {
+            chunksRef.current.push(e.data);
+            if (deepgramSocketRef.current?.readyState === 1) {
+                deepgramSocketRef.current.send(e.data);
+            }
+        }
       };
 
       mediaRecorder.onstop = () => {
         const blob = new Blob(chunksRef.current, { type: 'audio/webm' });
         chunksRef.current = [];
-        processChunk(blob);
+        processWhisperChunk(blob);
         if (isRecordingRef.current) {
           mediaRecorder.start();
         }
@@ -105,17 +130,18 @@ const InterviewCopilot = () => {
       mediaRecorderRef.current = mediaRecorder;
       isRecordingRef.current = true;
       setIsRecording(true);
-      mediaRecorder.start();
-      setStatus('Whisper Core Active.');
+      mediaRecorder.start(250); // Small slices for Deepgram
+      setStatus('Hybrid ASR Active (Deepgram + Whisper)');
 
+      // 6-second intervals for Whisper accuracy
       intervalRef.current = setInterval(() => {
         if (mediaRecorderRef.current?.state === 'recording') {
           mediaRecorderRef.current.stop();
         }
-      }, 5000); // 5 sec chunks for better responsiveness
+      }, 6000);
 
     } catch (err: any) {
-      console.error("Mic error", err);
+      console.error("Start error", err);
       setStatus(`Error: ${err.message}`);
     }
   };
@@ -125,11 +151,9 @@ const InterviewCopilot = () => {
     setIsRecording(false);
     if (intervalRef.current) clearInterval(intervalRef.current);
     mediaRecorderRef.current?.stop();
+    deepgramSocketRef.current?.close();
     setStatus('Copilot Standby.');
-  };
-
-  const confirmMatch = (index: number) => {
-    setMatches(prev => prev.map((m, i) => i === index ? { ...m, confirmed: true } : m));
+    setInterimText("");
   };
 
   return (
@@ -137,8 +161,8 @@ const InterviewCopilot = () => {
       <header className="flex flex-col md:flex-row md:items-end justify-between gap-4">
         <div className="space-y-2">
           <div className="flex items-center gap-2 text-accent">
-            <div className={`w-2 h-2 rounded-full ${isRecording ? 'bg-red-500 animate-pulse' : 'bg-secondary'}`} />
-            <span className="font-mono text-[10px] uppercase tracking-[0.2em]">{isRecording ? 'WHISPER_TURBO_LIVE' : 'NEURAL_STBY'}</span>
+            <Radio size={14} className={isRecording ? 'animate-pulse' : ''} />
+            <span className="font-mono text-[10px] uppercase tracking-[0.2em]">{isRecording ? 'HYBRID_SYNC_LIVE' : 'NEURAL_STBY'}</span>
           </div>
           <h2 className="text-3xl font-bold tracking-tight">Interview Copilot</h2>
         </div>
@@ -152,7 +176,6 @@ const InterviewCopilot = () => {
       </header>
 
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-8">
-        {/* Main Feed */}
         <div className="lg:col-span-8 space-y-6">
           <div className="premium-card min-h-[500px] lg:h-[650px] flex flex-col p-0 overflow-hidden relative border-white/5">
             <div className="flex items-center justify-between p-6 border-b border-white/5 bg-white/[0.02]">
@@ -161,59 +184,61 @@ const InterviewCopilot = () => {
                 NEURAL_TRANSCRIPT
               </h3>
               <div className="flex gap-4 items-center">
+                <span className="text-[10px] font-mono text-secondary">NOVA_2 + WHISPER_V3</span>
                 {isProcessing && <Loader2 className="animate-spin text-accent" size={14} />}
-                <span className="text-[10px] font-mono text-accent">GROQ_V3</span>
               </div>
             </div>
             
-            <div className="flex-1 overflow-y-auto p-6 md:p-8 space-y-8 scrollbar-hide">
-              {transcript.length === 0 && !isRecording && (
+            <div className="flex-1 overflow-y-auto p-6 md:p-8 space-y-6 scrollbar-hide">
+              {transcript.length === 0 && !interimText && !isRecording && (
                 <div className="h-full flex flex-col items-center justify-center text-center opacity-20">
-                  <Play size={48} className="mb-4" />
-                  <p className="font-mono text-[10px] uppercase tracking-[0.2em]">Ready for neural capture</p>
+                  <Brain size={48} className="mb-4" />
+                  <p className="font-mono text-[10px] uppercase tracking-[0.2em]">Ready for hybrid capture</p>
                 </div>
               )}
+              
               {transcript.map((line, i) => (
                 <motion.div 
                   key={i}
-                  initial={{ opacity: 0, y: 10 }}
+                  initial={{ opacity: 0, y: 5 }}
                   animate={{ opacity: 1, y: 0 }}
-                  className={`flex ${line.role === 'INT' ? 'justify-start' : 'justify-end'}`}
+                  className="flex justify-end"
                 >
-                  <div className={`max-w-[80%] flex flex-col ${line.role === 'INT' ? 'items-start' : 'items-end'}`}>
-                    <div className="flex items-center gap-2 mb-2 px-1">
-                      <span className={`text-[10px] font-mono uppercase tracking-widest ${line.role === 'INT' ? 'text-secondary' : 'text-accent'}`}>
-                        {line.role === 'INT' ? 'Interviewer' : 'Candidate'}
-                      </span>
-                    </div>
-                    <div className={`p-4 rounded-2xl text-sm leading-relaxed ${
-                      line.role === 'INT' 
-                        ? 'bg-white/5 border border-white/5 text-secondary/90' 
-                        : 'bg-accent/10 border border-accent/20 text-white'
-                    }`}>
+                  <div className="max-w-[85%] flex flex-col items-end">
+                    <span className="text-[9px] font-mono uppercase tracking-widest text-accent mb-1 opacity-50">VERIFIED_WHISPER</span>
+                    <div className="p-4 rounded-2xl text-sm leading-relaxed bg-accent/10 border border-accent/20 text-white">
                       {line.text}
                     </div>
                   </div>
                 </motion.div>
               ))}
+
+              {interimText && (
+                <motion.div className="flex justify-end opacity-60 italic">
+                  <div className="max-w-[85%] flex flex-col items-end">
+                    <span className="text-[9px] font-mono uppercase tracking-widest text-secondary mb-1">NOVA_2_LIVE</span>
+                    <div className="p-4 rounded-2xl text-sm leading-relaxed bg-white/5 border border-white/10 text-white/70">
+                      {interimText}...
+                    </div>
+                  </div>
+                </motion.div>
+              )}
               <div ref={transcriptEndRef} />
             </div>
 
             {isRecording && (
-               <div className="p-4 bg-black/40 backdrop-blur-sm border-t border-white/5 flex items-center justify-between">
-                  <div className="flex items-center gap-4">
-                    <div className="flex gap-1">
-                      {[1,2,3].map(i => (
-                        <motion.div 
-                          key={i}
-                          animate={{ height: [4, 12, 4] }}
-                          transition={{ repeat: Infinity, duration: 0.6, delay: i * 0.2 }}
-                          className="w-1 bg-accent rounded-full"
-                        />
-                      ))}
-                    </div>
-                    <span className="text-[10px] font-mono text-secondary uppercase tracking-widest">{status}</span>
+               <div className="p-4 bg-black/40 backdrop-blur-sm border-t border-white/5 flex items-center gap-4">
+                  <div className="flex gap-1">
+                    {[1,2,3].map(i => (
+                      <motion.div 
+                        key={i}
+                        animate={{ height: [4, 12, 4] }}
+                        transition={{ repeat: Infinity, duration: 0.6, delay: i * 0.2 }}
+                        className="w-1 bg-accent rounded-full"
+                      />
+                    ))}
                   </div>
+                  <span className="text-[10px] font-mono text-secondary uppercase tracking-widest">{status}</span>
                </div>
             )}
           </div>
@@ -252,18 +277,6 @@ const InterviewCopilot = () => {
                     <p className="text-xs text-secondary italic leading-normal border-l-2 border-accent/30 pl-3 line-clamp-3">
                       "{match.snippet}"
                     </p>
-
-                    <div className="flex gap-2 pt-2">
-                       <button 
-                        onClick={() => confirmMatch(i)}
-                        disabled={match.confirmed}
-                        className={`flex-1 py-2 rounded-lg text-[10px] font-bold transition-all ${
-                          match.confirmed ? 'bg-green-400/20 text-green-400' : 'bg-white text-black hover:bg-white/80'
-                        }`}
-                       >
-                         {match.confirmed ? 'VERIFIED' : 'CONFIRM IDENTITY'}
-                       </button>
-                    </div>
                   </motion.div>
                 ))}
               </AnimatePresence>
@@ -271,20 +284,10 @@ const InterviewCopilot = () => {
               {matches.length === 0 && (
                 <div className="py-12 flex flex-col items-center justify-center text-center text-secondary/30">
                   <Brain size={32} className="mb-4 opacity-10" />
-                  <p className="text-[10px] font-mono uppercase tracking-widest leading-relaxed">Neural analysis active. Listening for colleagues and companies.</p>
+                  <p className="text-[10px] font-mono uppercase tracking-widest leading-relaxed">AI is listening. Nova-2 showing real-time, Whisper verifying entities.</p>
                 </div>
               )}
             </div>
-          </div>
-
-          <div className="premium-card p-6 md:p-8 bg-black/20">
-             <div className="flex items-center gap-2 mb-4">
-                <Brain size={18} className="text-secondary" />
-                <h4 className="text-sm font-bold uppercase tracking-tight">System Intel</h4>
-             </div>
-             <p className="text-xs text-secondary leading-relaxed font-mono italic">
-               {isProcessing ? 'Syncing with Groq Portal...' : 'Neural Stream Optimized.'}
-             </p>
           </div>
         </div>
       </div>
