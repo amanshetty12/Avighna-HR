@@ -47,6 +47,8 @@ const InterviewCopilot = () => {
   const sysStreamRef = useRef<MediaStream | null>(null);
   const sysSocketRef = useRef<WebSocket | null>(null);
   const sysRecorderRef = useRef<MediaRecorder | null>(null);
+  const sysChunksRef = useRef<Blob[]>([]);
+  const sysIntervalRef = useRef<any>(null);
 
   useEffect(() => {
     transcriptEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -56,7 +58,6 @@ const InterviewCopilot = () => {
   const analyzeText = async (text: string) => {
     if (!text || text.trim().length < 5) return;
     
-    setIsProcessing(true);
     try {
       const extractRes = await axios.post(`${API_BASE}/interview/analyze-stream?text=${encodeURIComponent(text)}`);
       const newEntities = extractRes.data.entities;
@@ -79,6 +80,31 @@ const InterviewCopilot = () => {
       }
     } catch (e) {
       console.error("Analysis error", e);
+    }
+  };
+
+  // Whisper "Gold Standard" processing - runs on audio chunks for accurate final transcript
+  const processWhisperChunk = async (audioBlob: Blob, role: 'INT' | 'CAN') => {
+    if (audioBlob.size < 1000) return; 
+    
+    setIsProcessing(true);
+    const formData = new FormData();
+    formData.append('file', audioBlob, 'chunk.webm');
+
+    try {
+      const transRes = await axios.post(`${API_BASE}/interview/transcribe`, formData);
+      const goldText = transRes.data.transcript;
+      
+      if (goldText && goldText.trim().length > 2) {
+        // Add Whisper-verified transcript as final
+        setTranscript(prev => [...prev, { role, text: goldText, isFinal: true }]);
+        console.log(`[WHISPER FINAL] ${role}: ${goldText}`);
+        
+        // Trigger Entity Extraction on accurate Whisper text
+        analyzeText(goldText);
+      }
+    } catch (e) {
+      console.error("Whisper error", e);
     } finally {
       setIsProcessing(false);
     }
@@ -120,19 +146,8 @@ const InterviewCopilot = () => {
 
       lastSpeakerRef.current = assignedRole;
 
-      // When Deepgram marks the transcript as final, add it directly to the transcript array
-      // This prevents candidate's full speech from being lost to interim overwrites
-      if (data.is_final || data.speech_final) {
-        setTranscript(prev => [...prev, { role: assignedRole, text, isFinal: true }]);
-        setInterimText("");
-        console.log(`[FINAL] ${assignedRole}: ${text}`);
-        
-        // Trigger entity extraction on every final transcript
-        analyzeText(text);
-      } else {
-        // Non-final (interim) results just show as the live preview
-        setInterimText(JSON.stringify({ role: assignedRole, text }));
-      }
+      // Deepgram is ONLY for real-time interim preview. Whisper handles final transcripts.
+      setInterimText(JSON.stringify({ role: assignedRole, text }));
     };
 
     socket.onerror = (e) => {
@@ -208,7 +223,40 @@ const InterviewCopilot = () => {
     const sysAudioOnly = new MediaStream(sysStream.getAudioTracks());
     sysRecorderRef.current = pipeStreamToSocket(sysAudioOnly, sysSocket);
 
-    setStatus('Dual-Socket Active (Mic=INT, Tab=CAN)');
+    // 5. Whisper "Gold Standard" processing on BOTH streams
+    // Mic Whisper (INT)
+    const micWhisper = new MediaRecorder(micStream, { mimeType: 'audio/webm' });
+    micWhisper.ondataavailable = (e) => {
+      if (e.data.size > 0) micChunksRef.current.push(e.data);
+    };
+    micWhisper.onstop = () => {
+      const blob = new Blob(micChunksRef.current, { type: 'audio/webm' });
+      micChunksRef.current = [];
+      processWhisperChunk(blob, 'INT');
+      if (isRecordingRef.current) micWhisper.start();
+    };
+    micWhisper.start();
+    micIntervalRef.current = setInterval(() => {
+      if (micWhisper.state === 'recording') micWhisper.stop();
+    }, 6000);
+
+    // System Audio Whisper (CAN)
+    const sysWhisper = new MediaRecorder(sysAudioOnly, { mimeType: 'audio/webm' });
+    sysWhisper.ondataavailable = (e) => {
+      if (e.data.size > 0) sysChunksRef.current.push(e.data);
+    };
+    sysWhisper.onstop = () => {
+      const blob = new Blob(sysChunksRef.current, { type: 'audio/webm' });
+      sysChunksRef.current = [];
+      processWhisperChunk(blob, 'CAN');
+      if (isRecordingRef.current) sysWhisper.start();
+    };
+    sysWhisper.start();
+    sysIntervalRef.current = setInterval(() => {
+      if (sysWhisper.state === 'recording') sysWhisper.stop();
+    }, 6000);
+
+    setStatus('Dual-Socket Active (Deepgram Live + Whisper Verified)');
   };
 
   // ============ IN-PERSON MODE: Single mic with diarization ============
@@ -229,7 +277,24 @@ const InterviewCopilot = () => {
 
     micRecorderRef.current = pipeStreamToSocket(micStream, socket);
 
-    setStatus('In-Person Mode Active (AI Diarization)');
+    // Whisper processing for in-person mode
+    const micWhisper = new MediaRecorder(micStream, { mimeType: 'audio/webm' });
+    micWhisper.ondataavailable = (e) => {
+      if (e.data.size > 0) micChunksRef.current.push(e.data);
+    };
+    micWhisper.onstop = () => {
+      const blob = new Blob(micChunksRef.current, { type: 'audio/webm' });
+      micChunksRef.current = [];
+      // In-person: use lastSpeakerRef set by Deepgram diarization
+      processWhisperChunk(blob, lastSpeakerRef.current);
+      if (isRecordingRef.current) micWhisper.start();
+    };
+    micWhisper.start();
+    micIntervalRef.current = setInterval(() => {
+      if (micWhisper.state === 'recording') micWhisper.stop();
+    }, 6000);
+
+    setStatus('In-Person Mode Active (Deepgram Live + Whisper Verified)');
   };
 
   const startCopilot = async () => {
@@ -253,6 +318,7 @@ const InterviewCopilot = () => {
     isRecordingRef.current = false;
     setIsRecording(false);
     if (micIntervalRef.current) clearInterval(micIntervalRef.current);
+    if (sysIntervalRef.current) clearInterval(sysIntervalRef.current);
     
     // Stop recorders
     micRecorderRef.current?.stop();
