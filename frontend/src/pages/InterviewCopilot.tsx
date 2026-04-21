@@ -131,7 +131,17 @@ const InterviewCopilot = () => {
       }
 
       lastSpeakerRef.current = assignedRole;
-      setInterimText(JSON.stringify({ role: assignedRole, text }));
+
+      // When Deepgram marks the transcript as final, add it directly to the transcript array
+      // This prevents candidate's full speech from being lost to interim overwrites
+      if (data.is_final || data.speech_final) {
+        setTranscript(prev => [...prev, { role: assignedRole, text, isFinal: true }]);
+        setInterimText(""); // Clear interim since we just finalized
+        console.log(`[FINAL] ${assignedRole}: ${text}`);
+      } else {
+        // Non-final (interim) results just show as the live preview
+        setInterimText(JSON.stringify({ role: assignedRole, text }));
+      }
     };
 
     socket.onerror = (e) => {
