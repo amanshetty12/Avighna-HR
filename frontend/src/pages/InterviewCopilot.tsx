@@ -52,45 +52,33 @@ const InterviewCopilot = () => {
     transcriptEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [transcript, interimText]);
 
-  const processWhisperChunk = async (audioBlob: Blob) => {
-    if (audioBlob.size < 1000) return; 
+  // Analyze text for entity extraction (IDENTIFIED_NETWORK)
+  const analyzeText = async (text: string) => {
+    if (!text || text.trim().length < 5) return;
     
     setIsProcessing(true);
-    const formData = new FormData();
-    formData.append('file', audioBlob, 'chunk.webm');
-
     try {
-      // Whisper-v3-Turbo for "Gold Standard" Transcript
-      const transRes = await axios.post(`${API_BASE}/interview/transcribe`, formData);
-      const goldText = transRes.data.transcript;
+      const extractRes = await axios.post(`${API_BASE}/interview/analyze-stream?text=${encodeURIComponent(text)}`);
+      const newEntities = extractRes.data.entities;
       
-      if (goldText && goldText.trim().length > 2) {
-        setInterimText(""); 
-        setTranscript(prev => [...prev, { role: lastSpeakerRef.current, text: goldText, isFinal: true }]);
-        
-        // Trigger Analysis on the Gold Text
-        const extractRes = await axios.post(`${API_BASE}/interview/analyze-stream?text=${encodeURIComponent(goldText)}`);
-        const newEntities = extractRes.data.entities;
-        
-        if (newEntities && newEntities.length > 0) {
-            newEntities.forEach((ent: any) => {
-              const match = ent.matches[0];
-              if (match && !matches.find(m => m.name === ent.entity.name)) {
-                setMatches(prev => [...prev, {
-                  name: ent.entity.name,
-                  company: ent.entity.company,
-                  role: ent.entity.role,
-                  linkedinUrl: match.link,
-                  snippet: match.snippet,
-                  confirmed: false
-                }]);
-              }
-            });
-            setStatus('Network match identified.');
-        }
+      if (newEntities && newEntities.length > 0) {
+          newEntities.forEach((ent: any) => {
+            const match = ent.matches[0];
+            if (match && !matches.find(m => m.name === ent.entity.name)) {
+              setMatches(prev => [...prev, {
+                name: ent.entity.name,
+                company: ent.entity.company,
+                role: ent.entity.role,
+                linkedinUrl: match.link,
+                snippet: match.snippet,
+                confirmed: false
+              }]);
+            }
+          });
+          setStatus('Network match identified.');
       }
     } catch (e) {
-      console.error("Whisper error", e);
+      console.error("Analysis error", e);
     } finally {
       setIsProcessing(false);
     }
@@ -136,8 +124,11 @@ const InterviewCopilot = () => {
       // This prevents candidate's full speech from being lost to interim overwrites
       if (data.is_final || data.speech_final) {
         setTranscript(prev => [...prev, { role: assignedRole, text, isFinal: true }]);
-        setInterimText(""); // Clear interim since we just finalized
+        setInterimText("");
         console.log(`[FINAL] ${assignedRole}: ${text}`);
+        
+        // Trigger entity extraction on every final transcript
+        analyzeText(text);
       } else {
         // Non-final (interim) results just show as the live preview
         setInterimText(JSON.stringify({ role: assignedRole, text }));
@@ -217,22 +208,6 @@ const InterviewCopilot = () => {
     const sysAudioOnly = new MediaStream(sysStream.getAudioTracks());
     sysRecorderRef.current = pipeStreamToSocket(sysAudioOnly, sysSocket);
 
-    // 5. Whisper chunk processing on mic only
-    const whisperRecorder = new MediaRecorder(micStream, { mimeType: 'audio/webm' });
-    whisperRecorder.ondataavailable = (e) => {
-      if (e.data.size > 0) micChunksRef.current.push(e.data);
-    };
-    whisperRecorder.onstop = () => {
-      const blob = new Blob(micChunksRef.current, { type: 'audio/webm' });
-      micChunksRef.current = [];
-      processWhisperChunk(blob);
-      if (isRecordingRef.current) whisperRecorder.start();
-    };
-    whisperRecorder.start();
-    micIntervalRef.current = setInterval(() => {
-      if (whisperRecorder.state === 'recording') whisperRecorder.stop();
-    }, 6000);
-
     setStatus('Dual-Socket Active (Mic=INT, Tab=CAN)');
   };
 
@@ -253,22 +228,6 @@ const InterviewCopilot = () => {
     await new Promise<void>((resolve) => { socket.addEventListener('open', () => resolve()); });
 
     micRecorderRef.current = pipeStreamToSocket(micStream, socket);
-
-    // Whisper chunk processing
-    const whisperRecorder = new MediaRecorder(micStream, { mimeType: 'audio/webm' });
-    whisperRecorder.ondataavailable = (e) => {
-      if (e.data.size > 0) micChunksRef.current.push(e.data);
-    };
-    whisperRecorder.onstop = () => {
-      const blob = new Blob(micChunksRef.current, { type: 'audio/webm' });
-      micChunksRef.current = [];
-      processWhisperChunk(blob);
-      if (isRecordingRef.current) whisperRecorder.start();
-    };
-    whisperRecorder.start();
-    micIntervalRef.current = setInterval(() => {
-      if (whisperRecorder.state === 'recording') whisperRecorder.stop();
-    }, 6000);
 
     setStatus('In-Person Mode Active (AI Diarization)');
   };
