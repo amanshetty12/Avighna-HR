@@ -95,7 +95,13 @@ const InterviewCopilot = () => {
     try {
       setStatus('Requesting Audio Permissions...');
       // 1. Capture Microphone (Interviewer)
-      const micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const micStream = await navigator.mediaDevices.getUserMedia({ 
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true
+        } 
+      });
       micStreamRef.current = micStream;
 
       // 2. Capture System/Tab Audio (Candidate)
@@ -124,6 +130,11 @@ const InterviewCopilot = () => {
       
       const merger = ctx.createChannelMerger(2);
       const dest = ctx.createMediaStreamDestination();
+      
+      // Force stereo properties on the destination stream
+      dest.channelCount = 2;
+      dest.channelCountMode = 'explicit';
+      dest.channelInterpretation = 'discrete';
 
       // Route Mic to Left (Channel 0) -> INT
       micSource.connect(merger, 0, 0);
@@ -154,6 +165,7 @@ const InterviewCopilot = () => {
             lastSpeakerRef.current = role;
 
             if (transcript) {
+                console.log(`Deepgram Channel Debug: [Channel ${channelIndex}] -> ${role}: ${transcript}`);
                 setInterimText(JSON.stringify({ role, text: transcript }));
             }
         };
@@ -161,7 +173,11 @@ const InterviewCopilot = () => {
       }
 
       // 5. Setup MediaRecorder for the Mixed Stream
-      const mediaRecorder = new MediaRecorder(mixedStream, { mimeType: 'audio/webm' });
+      // Force high-bitrate opus to preserve both channels
+      const mediaRecorder = new MediaRecorder(mixedStream, { 
+        mimeType: 'audio/webm;codecs=opus',
+        audioBitsPerSecond: 128000
+      });
       mediaRecorder.ondataavailable = (e) => {
         if (e.data.size > 0) {
             chunksRef.current.push(e.data);
