@@ -121,7 +121,7 @@ const InterviewCopilot = () => {
           throw new Error("System Audio not shared. Please check 'Share tab audio' when sharing.");
       }
 
-      // 3. Setup AudioContext for Merging
+      // 3. Setup AudioContext for Merging (Advanced Stereo Configuration)
       const ctx = new (window.AudioContext || (window as any).webkitAudioContext)();
       audioCtxRef.current = ctx;
 
@@ -130,8 +130,8 @@ const InterviewCopilot = () => {
       
       const merger = ctx.createChannelMerger(2);
       const dest = ctx.createMediaStreamDestination();
-      
-      // Force stereo properties on the destination stream
+
+      // Force explicit stereo properties to prevent mono downmixing
       dest.channelCount = 2;
       dest.channelCountMode = 'explicit';
       dest.channelInterpretation = 'discrete';
@@ -147,27 +147,56 @@ const InterviewCopilot = () => {
       // We use the merged stereo stream for recording
       const mixedStream = dest.stream;
 
-      // 4. Setup Deepgram Nova-2 with Multichannel
+      // 4. Setup Deepgram Nova-2 with Hybrid Identification (Multichannel + Diarization)
       if (DEEPGRAM_KEY) {
-        const socket = new WebSocket('wss://api.deepgram.com/v1/listen?model=nova-2&smart_format=true&multichannel=true', [
+        // We use both multichannel and diarization for maximum reliability
+        const socket = new WebSocket('wss://api.deepgram.com/v1/listen?model=nova-2&smart_format=true&multichannel=true&diarize=true', [
             'token',
             DEEPGRAM_KEY,
         ]);
 
-        socket.onopen = () => console.log("Deepgram Multichannel Active");
+        socket.onopen = () => {
+            console.log("Deepgram Hybrid Multichannel Active");
+            // Reset speaker tracking on start
+            (window as any)._speakerMap = new Map();
+        };
+
         socket.onmessage = (message) => {
             const data = JSON.parse(message.data);
-            const transcript = data.channel?.alternatives[0]?.transcript;
+            if (!data.channel?.alternatives?.[0]) return;
             
-            // Channel 0 = Left (Mic/INT), Channel 1 = Right (System/CAN)
-            const channelIndex = data.channel_index?.[0] ?? 0;
-            const role = channelIndex === 1 ? 'CAN' : 'INT';
-            lastSpeakerRef.current = role;
+            const transcript = data.channel.alternatives[0].transcript;
+            if (!transcript) return;
 
-            if (transcript) {
-                console.log(`Deepgram Channel Debug: [Channel ${channelIndex}] -> ${role}: ${transcript}`);
-                setInterimText(JSON.stringify({ role, text: transcript }));
+            // Channel 0 = Left (Mic/INT), Channel 1 = Right (System/CAN)
+            // Deepgram streaming returns channel_index as [index, total]
+            const channelIndex = data.channel_index?.[0] ?? 0;
+            
+            // Speaker ID from Diarization (if available)
+            const words = data.channel.alternatives[0].words;
+            const speakerId = words?.[0]?.speaker ?? 0;
+            
+            let role: 'INT' | 'CAN' = 'INT';
+
+            if (channelIndex === 1) {
+                // Anything on the system channel is definitely the candidate
+                role = 'CAN';
+            } else {
+                // On the mic channel (0), we use diarization to distinguish
+                const speakerMap = (window as any)._speakerMap;
+                if (speakerMap && !speakerMap.has(speakerId)) {
+                    // First speaker on the mic is interviewer. 
+                    // Any new speaker ID on the mic after that is treated as Candidate leak.
+                    const assignedRole = speakerMap.size === 0 ? 'INT' : 'CAN';
+                    speakerMap.set(speakerId, assignedRole);
+                    console.log(`Deepgram Assignment: Speaker ${speakerId} on Channel 0 -> ${assignedRole}`);
+                }
+                role = (speakerMap?.get(speakerId)) || 'INT';
             }
+
+            console.log(`[CH ${channelIndex} | SP ${speakerId}] -> ${role}: ${transcript}`);
+            lastSpeakerRef.current = role;
+            setInterimText(JSON.stringify({ role, text: transcript }));
         };
         deepgramSocketRef.current = socket;
       }
