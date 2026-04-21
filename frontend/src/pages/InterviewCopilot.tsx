@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { Terminal, Play, ShieldCheck, Brain, Link, UserCheck, Loader2, Radio } from 'lucide-react';
+import { Terminal, Play, ShieldCheck, Brain, Link, UserCheck, Loader2, Radio, Monitor, Mic } from 'lucide-react';
 import axios from 'axios';
 
 interface TranscriptLine {
@@ -18,6 +18,8 @@ interface Match {
   confirmed?: boolean;
 }
 
+type InterviewMode = 'virtual' | 'in-person';
+
 const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:8000';
 const DEEPGRAM_KEY = import.meta.env.VITE_DEEPGRAM_API_KEY;
 
@@ -28,19 +30,23 @@ const InterviewCopilot = () => {
   const [interimText, setInterimText] = useState("");
   const [matches, setMatches] = useState<Match[]>([]);
   const [status, setStatus] = useState('Neural Copilot Ready');
+  const [mode, setMode] = useState<InterviewMode>('virtual');
   
   const isRecordingRef = useRef(false);
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-  const deepgramSocketRef = useRef<WebSocket | null>(null);
   const transcriptEndRef = useRef<HTMLDivElement>(null);
-  const chunksRef = useRef<Blob[]>([]);
-  const intervalRef = useRef<any>(null);
   const lastSpeakerRef = useRef<'INT' | 'CAN'>('INT');
   
-  // Dual-Channel Refs
-  const audioCtxRef = useRef<AudioContext | null>(null);
+  // Mic refs
   const micStreamRef = useRef<MediaStream | null>(null);
+  const micSocketRef = useRef<WebSocket | null>(null);
+  const micRecorderRef = useRef<MediaRecorder | null>(null);
+  const micChunksRef = useRef<Blob[]>([]);
+  const micIntervalRef = useRef<any>(null);
+
+  // System audio refs (virtual mode only)
   const sysStreamRef = useRef<MediaStream | null>(null);
+  const sysSocketRef = useRef<WebSocket | null>(null);
+  const sysRecorderRef = useRef<MediaRecorder | null>(null);
 
   useEffect(() => {
     transcriptEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -59,7 +65,6 @@ const InterviewCopilot = () => {
       const goldText = transRes.data.transcript;
       
       if (goldText && goldText.trim().length > 2) {
-        // Clear interim text as we now have "Gold" text for this segment
         setInterimText(""); 
         setTranscript(prev => [...prev, { role: lastSpeakerRef.current, text: goldText, isFinal: true }]);
         
@@ -91,152 +96,183 @@ const InterviewCopilot = () => {
     }
   };
 
+  // Creates a Deepgram WebSocket for a specific role
+  const createDeepgramSocket = (role: 'INT' | 'CAN', useDiarization: boolean): WebSocket | null => {
+    if (!DEEPGRAM_KEY) return null;
+    
+    let url = 'wss://api.deepgram.com/v1/listen?model=nova-2&smart_format=true';
+    if (useDiarization) {
+      url += '&diarize=true';
+    }
+    
+    const socket = new WebSocket(url, ['token', DEEPGRAM_KEY]);
+
+    socket.onopen = () => {
+      console.log(`Deepgram [${role}] WebSocket Active`);
+    };
+
+    socket.onmessage = (message) => {
+      const data = JSON.parse(message.data);
+      if (!data.channel?.alternatives?.[0]) return;
+      
+      const text = data.channel.alternatives[0].transcript;
+      if (!text) return;
+
+      let assignedRole: 'INT' | 'CAN' = role;
+
+      // In diarization mode (in-person), use speaker IDs
+      if (useDiarization) {
+        const speakerId = data.channel.alternatives[0].words?.[0]?.speaker ?? 0;
+        // Speaker 0 = first speaker = Interviewer, Speaker 1+ = Candidate
+        assignedRole = speakerId === 0 ? 'INT' : 'CAN';
+        console.log(`[IN-PERSON | Speaker ${speakerId}] -> ${assignedRole}: ${text}`);
+      } else {
+        console.log(`[${role} SOCKET] -> ${assignedRole}: ${text}`);
+      }
+
+      lastSpeakerRef.current = assignedRole;
+      setInterimText(JSON.stringify({ role: assignedRole, text }));
+    };
+
+    socket.onerror = (e) => {
+      console.error(`Deepgram [${role}] error:`, e);
+    };
+
+    return socket;
+  };
+
+  // Pipes a MediaStream into a Deepgram WebSocket
+  const pipeStreamToSocket = (stream: MediaStream, socket: WebSocket): MediaRecorder => {
+    const recorder = new MediaRecorder(stream, { 
+      mimeType: 'audio/webm;codecs=opus',
+      audioBitsPerSecond: 128000
+    });
+
+    recorder.ondataavailable = (e) => {
+      if (e.data.size > 0 && socket.readyState === 1) {
+        socket.send(e.data);
+      }
+    };
+
+    recorder.start(250); // 250ms slices for real-time streaming
+    return recorder;
+  };
+
+  // ============ VIRTUAL MODE: Two separate WebSockets ============
+  const startVirtual = async () => {
+    setStatus('Requesting Mic + Tab Audio...');
+
+    // 1. Get Microphone
+    const micStream = await navigator.mediaDevices.getUserMedia({ 
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } 
+    });
+    micStreamRef.current = micStream;
+
+    // 2. Get System/Tab Audio
+    const sysStream = await navigator.mediaDevices.getDisplayMedia({ 
+      video: true, 
+      audio: {
+        channelCount: 1,
+        autoGainControl: false,
+        echoCancellation: false,
+        noiseSuppression: false
+      } as any
+    });
+    sysStreamRef.current = sysStream;
+
+    if (!sysStream.getAudioTracks().length) {
+      throw new Error("System Audio not shared. Please check 'Share tab audio' when sharing.");
+    }
+
+    // 3. Create TWO separate Deepgram WebSockets (bypasses Chrome mono limitation!)
+    const micSocket = createDeepgramSocket('INT', false);
+    const sysSocket = createDeepgramSocket('CAN', false);
+    
+    if (!micSocket || !sysSocket) throw new Error("Deepgram API key missing");
+
+    micSocketRef.current = micSocket;
+    sysSocketRef.current = sysSocket;
+
+    // Wait for both sockets to open before piping audio
+    await Promise.all([
+      new Promise<void>((resolve) => { micSocket.addEventListener('open', () => resolve()); }),
+      new Promise<void>((resolve) => { sysSocket.addEventListener('open', () => resolve()); }),
+    ]);
+
+    // 4. Pipe each stream to its own WebSocket independently
+    // This is the key fix: no merging, no stereo, no Chrome downmixing!
+    micRecorderRef.current = pipeStreamToSocket(micStream, micSocket);
+    
+    // For system audio, we extract just the audio tracks into a new stream
+    const sysAudioOnly = new MediaStream(sysStream.getAudioTracks());
+    sysRecorderRef.current = pipeStreamToSocket(sysAudioOnly, sysSocket);
+
+    // 5. Whisper chunk processing on mic only
+    const whisperRecorder = new MediaRecorder(micStream, { mimeType: 'audio/webm' });
+    whisperRecorder.ondataavailable = (e) => {
+      if (e.data.size > 0) micChunksRef.current.push(e.data);
+    };
+    whisperRecorder.onstop = () => {
+      const blob = new Blob(micChunksRef.current, { type: 'audio/webm' });
+      micChunksRef.current = [];
+      processWhisperChunk(blob);
+      if (isRecordingRef.current) whisperRecorder.start();
+    };
+    whisperRecorder.start();
+    micIntervalRef.current = setInterval(() => {
+      if (whisperRecorder.state === 'recording') whisperRecorder.stop();
+    }, 6000);
+
+    setStatus('Dual-Socket Active (Mic=INT, Tab=CAN)');
+  };
+
+  // ============ IN-PERSON MODE: Single mic with diarization ============
+  const startInPerson = async () => {
+    setStatus('Requesting Microphone...');
+
+    const micStream = await navigator.mediaDevices.getUserMedia({ 
+      audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: true } 
+    });
+    micStreamRef.current = micStream;
+
+    // Single socket with diarization
+    const socket = createDeepgramSocket('INT', true);
+    if (!socket) throw new Error("Deepgram API key missing");
+    micSocketRef.current = socket;
+
+    await new Promise<void>((resolve) => { socket.addEventListener('open', () => resolve()); });
+
+    micRecorderRef.current = pipeStreamToSocket(micStream, socket);
+
+    // Whisper chunk processing
+    const whisperRecorder = new MediaRecorder(micStream, { mimeType: 'audio/webm' });
+    whisperRecorder.ondataavailable = (e) => {
+      if (e.data.size > 0) micChunksRef.current.push(e.data);
+    };
+    whisperRecorder.onstop = () => {
+      const blob = new Blob(micChunksRef.current, { type: 'audio/webm' });
+      micChunksRef.current = [];
+      processWhisperChunk(blob);
+      if (isRecordingRef.current) whisperRecorder.start();
+    };
+    whisperRecorder.start();
+    micIntervalRef.current = setInterval(() => {
+      if (whisperRecorder.state === 'recording') whisperRecorder.stop();
+    }, 6000);
+
+    setStatus('In-Person Mode Active (AI Diarization)');
+  };
+
   const startCopilot = async () => {
     try {
-      setStatus('Requesting Audio Permissions...');
-      // 1. Capture Microphone (Interviewer)
-      const micStream = await navigator.mediaDevices.getUserMedia({ 
-        audio: {
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true
-        } 
-      });
-      micStreamRef.current = micStream;
-
-      // 2. Capture System/Tab Audio (Candidate)
-      // Using video: true because some browsers require it for getDisplayMedia to prompt
-      const sysStream = await navigator.mediaDevices.getDisplayMedia({ 
-        video: true, 
-        audio: {
-            channelCount: 2,
-            autoGainControl: false,
-            echoCancellation: false,
-            noiseSuppression: false
-        } as any
-      });
-      sysStreamRef.current = sysStream;
-
-      if (!sysStream.getAudioTracks().length) {
-          throw new Error("System Audio not shared. Please check 'Share tab audio' when sharing.");
-      }
-
-      // 3. Setup AudioContext for Merging (Advanced Stereo Configuration)
-      const ctx = new (window.AudioContext || (window as any).webkitAudioContext)();
-      audioCtxRef.current = ctx;
-
-      const micSource = ctx.createMediaStreamSource(micStream);
-      const sysSource = ctx.createMediaStreamSource(sysStream);
-      
-      const merger = ctx.createChannelMerger(2);
-      const dest = ctx.createMediaStreamDestination();
-
-      // Force explicit stereo properties to prevent mono downmixing
-      dest.channelCount = 2;
-      dest.channelCountMode = 'explicit';
-      dest.channelInterpretation = 'discrete';
-
-      // Route Mic to Left (Channel 0) -> INT
-      micSource.connect(merger, 0, 0);
-      
-      // Route System Audio to Right (Channel 1) -> CAN
-      sysSource.connect(merger, 0, 1);
-
-      merger.connect(dest);
-
-      // We use the merged stereo stream for recording
-      const mixedStream = dest.stream;
-
-      // 4. Setup Deepgram Nova-2 with Hybrid Identification (Multichannel + Diarization)
-      if (DEEPGRAM_KEY) {
-        // We use both multichannel and diarization for maximum reliability
-        const socket = new WebSocket('wss://api.deepgram.com/v1/listen?model=nova-2&smart_format=true&multichannel=true&diarize=true', [
-            'token',
-            DEEPGRAM_KEY,
-        ]);
-
-        socket.onopen = () => {
-            console.log("Deepgram Hybrid Multichannel Active");
-            // Reset speaker tracking on start
-            (window as any)._speakerMap = new Map();
-        };
-
-        socket.onmessage = (message) => {
-            const data = JSON.parse(message.data);
-            if (!data.channel?.alternatives?.[0]) return;
-            
-            const transcript = data.channel.alternatives[0].transcript;
-            if (!transcript) return;
-
-            // Channel 0 = Left (Mic/INT), Channel 1 = Right (System/CAN)
-            // Deepgram streaming returns channel_index as [index, total]
-            const channelIndex = data.channel_index?.[0] ?? 0;
-            
-            // Speaker ID from Diarization (if available)
-            const words = data.channel.alternatives[0].words;
-            const speakerId = words?.[0]?.speaker ?? 0;
-            
-            let role: 'INT' | 'CAN' = 'INT';
-
-            if (channelIndex === 1) {
-                // Anything on the system channel is definitely the candidate
-                role = 'CAN';
-            } else {
-                // On the mic channel (0), we use diarization to distinguish
-                const speakerMap = (window as any)._speakerMap;
-                if (speakerMap && !speakerMap.has(speakerId)) {
-                    // First speaker on the mic is interviewer. 
-                    // Any new speaker ID on the mic after that is treated as Candidate leak.
-                    const assignedRole = speakerMap.size === 0 ? 'INT' : 'CAN';
-                    speakerMap.set(speakerId, assignedRole);
-                    console.log(`Deepgram Assignment: Speaker ${speakerId} on Channel 0 -> ${assignedRole}`);
-                }
-                role = (speakerMap?.get(speakerId)) || 'INT';
-            }
-
-            console.log(`[CH ${channelIndex} | SP ${speakerId}] -> ${role}: ${transcript}`);
-            lastSpeakerRef.current = role;
-            setInterimText(JSON.stringify({ role, text: transcript }));
-        };
-        deepgramSocketRef.current = socket;
-      }
-
-      // 5. Setup MediaRecorder for the Mixed Stream
-      // Force high-bitrate opus to preserve both channels
-      const mediaRecorder = new MediaRecorder(mixedStream, { 
-        mimeType: 'audio/webm;codecs=opus',
-        audioBitsPerSecond: 128000
-      });
-      mediaRecorder.ondataavailable = (e) => {
-        if (e.data.size > 0) {
-            chunksRef.current.push(e.data);
-            if (deepgramSocketRef.current?.readyState === 1) {
-                deepgramSocketRef.current.send(e.data);
-            }
-        }
-      };
-
-      mediaRecorder.onstop = () => {
-        const blob = new Blob(chunksRef.current, { type: 'audio/webm' });
-        chunksRef.current = [];
-        processWhisperChunk(blob);
-        if (isRecordingRef.current) {
-          mediaRecorder.start();
-        }
-      };
-
-      mediaRecorderRef.current = mediaRecorder;
       isRecordingRef.current = true;
       setIsRecording(true);
-      mediaRecorder.start(250);
-      setStatus('Dual-Channel Active (Mic + System)');
 
-      intervalRef.current = setInterval(() => {
-        if (mediaRecorderRef.current?.state === 'recording') {
-          mediaRecorderRef.current.stop();
-        }
-      }, 6000);
-
+      if (mode === 'virtual') {
+        await startVirtual();
+      } else {
+        await startInPerson();
+      }
     } catch (err: any) {
       console.error("Start error", err);
       setStatus(`Error: ${err.message}`);
@@ -247,14 +283,19 @@ const InterviewCopilot = () => {
   const stopCopilot = () => {
     isRecordingRef.current = false;
     setIsRecording(false);
-    if (intervalRef.current) clearInterval(intervalRef.current);
-    mediaRecorderRef.current?.stop();
-    deepgramSocketRef.current?.close();
+    if (micIntervalRef.current) clearInterval(micIntervalRef.current);
     
-    // Stop tracks
+    // Stop recorders
+    micRecorderRef.current?.stop();
+    sysRecorderRef.current?.stop();
+
+    // Close sockets
+    micSocketRef.current?.close();
+    sysSocketRef.current?.close();
+    
+    // Stop all tracks
     micStreamRef.current?.getTracks().forEach(t => t.stop());
     sysStreamRef.current?.getTracks().forEach(t => t.stop());
-    audioCtxRef.current?.close();
 
     setStatus('Copilot Standby.');
     setInterimText("");
@@ -266,17 +307,46 @@ const InterviewCopilot = () => {
         <div className="space-y-2">
           <div className="flex items-center gap-2 text-accent">
             <Radio size={14} className={isRecording ? 'animate-pulse' : ''} />
-            <span className="font-mono text-[10px] uppercase tracking-[0.2em]">{isRecording ? 'HYBRID_SYNC_LIVE' : 'NEURAL_STBY'}</span>
+            <span className="font-mono text-[10px] uppercase tracking-[0.2em]">{isRecording ? 'DUAL_SOCKET_LIVE' : 'NEURAL_STBY'}</span>
           </div>
           <h2 className="text-3xl font-bold tracking-tight">Interview Copilot</h2>
         </div>
-        <button 
-          onClick={isRecording ? stopCopilot : startCopilot}
-          className={`px-8 py-3 rounded-xl font-bold transition-all shadow-lg flex items-center gap-2 ${isRecording ? 'bg-red-500 hover:bg-red-600 text-white' : 'bg-white text-black hover:bg-white/90'}`}
-        >
-          {isRecording ? <div className="w-2 h-2 bg-white rounded-full animate-pulse" /> : <Play size={16} />}
-          {isRecording ? 'STOP_ANALYSIS' : 'START_COPILOT'}
-        </button>
+        <div className="flex items-center gap-3">
+          {/* Mode Selector */}
+          {!isRecording && (
+            <div className="flex items-center bg-white/5 rounded-xl border border-white/10 overflow-hidden">
+              <button
+                onClick={() => setMode('virtual')}
+                className={`flex items-center gap-2 px-4 py-2.5 text-xs font-mono uppercase tracking-wider transition-all ${
+                  mode === 'virtual' 
+                    ? 'bg-accent/20 text-accent border-accent/30' 
+                    : 'text-secondary hover:text-white'
+                }`}
+              >
+                <Monitor size={14} />
+                Virtual
+              </button>
+              <button
+                onClick={() => setMode('in-person')}
+                className={`flex items-center gap-2 px-4 py-2.5 text-xs font-mono uppercase tracking-wider transition-all ${
+                  mode === 'in-person' 
+                    ? 'bg-accent/20 text-accent border-accent/30' 
+                    : 'text-secondary hover:text-white'
+                }`}
+              >
+                <Mic size={14} />
+                In-Person
+              </button>
+            </div>
+          )}
+          <button 
+            onClick={isRecording ? stopCopilot : startCopilot}
+            className={`px-8 py-3 rounded-xl font-bold transition-all shadow-lg flex items-center gap-2 ${isRecording ? 'bg-red-500 hover:bg-red-600 text-white' : 'bg-white text-black hover:bg-white/90'}`}
+          >
+            {isRecording ? <div className="w-2 h-2 bg-white rounded-full animate-pulse" /> : <Play size={16} />}
+            {isRecording ? 'STOP_ANALYSIS' : 'START_COPILOT'}
+          </button>
+        </div>
       </header>
 
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-8">
@@ -288,7 +358,9 @@ const InterviewCopilot = () => {
                 NEURAL_TRANSCRIPT
               </h3>
               <div className="flex gap-4 items-center">
-                <span className="text-[10px] font-mono text-secondary">NOVA_2 + WHISPER_V3</span>
+                <span className="text-[10px] font-mono text-secondary">
+                  {mode === 'virtual' ? 'DUAL_SOCKET' : 'DIARIZE'} + WHISPER_V3
+                </span>
                 {isProcessing && <Loader2 className="animate-spin text-accent" size={14} />}
               </div>
             </div>
@@ -297,7 +369,11 @@ const InterviewCopilot = () => {
               {transcript.length === 0 && !interimText && !isRecording && (
                 <div className="h-full flex flex-col items-center justify-center text-center opacity-20">
                   <Brain size={48} className="mb-4" />
-                  <p className="font-mono text-[10px] uppercase tracking-[0.2em]">Ready for hybrid capture</p>
+                  <p className="font-mono text-[10px] uppercase tracking-[0.2em]">
+                    {mode === 'virtual' 
+                      ? 'Virtual mode: Mic + Tab Audio (two separate streams)' 
+                      : 'In-person mode: Single mic with AI voice separation'}
+                  </p>
                 </div>
               )}
               
@@ -327,7 +403,7 @@ const InterviewCopilot = () => {
                 try {
                   const data = JSON.parse(interimText);
                   return (
-                    <motion.div className={`flex ${data.role === 'INT' ? 'justify-start' : 'end'} opacity-60 italic`}>
+                    <motion.div className={`flex ${data.role === 'INT' ? 'justify-start' : 'justify-end'} opacity-60 italic`}>
                       <div className={`max-w-[85%] flex flex-col ${data.role === 'INT' ? 'items-start' : 'items-end'}`}>
                         <span className={`text-[9px] font-mono uppercase tracking-widest mb-1 ${data.role === 'INT' ? 'text-secondary' : 'text-accent'}`}>
                           {data.role === 'INT' ? 'INT_LIVE' : 'CAN_LIVE'}
