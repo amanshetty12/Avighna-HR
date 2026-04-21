@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { NavLink } from 'react-router-dom';
-import { Home, Users, MessageSquare, ClipboardCheck, LayoutDashboard, Settings, Menu, X, BarChart3 } from 'lucide-react';
+import { Home, Users, MessageSquare, ClipboardCheck, LayoutDashboard, Settings, Menu, X, BarChart3, LogOut } from 'lucide-react';
+import { useAuth } from '../../context/AuthContext';
 import type { LucideIcon } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 
@@ -18,8 +19,8 @@ const NavItem = ({ to, icon: Icon, label, onClick }: NavItemProps) => (
     onClick={onClick}
     className={({ isActive }) => `
       flex items-center gap-3 px-4 py-3 rounded-xl transition-all duration-200 group
-      ${isActive 
-        ? 'bg-white/10 text-white' 
+      ${isActive
+        ? 'bg-white/10 text-white'
         : 'text-secondary hover:text-white hover:bg-white/5'}
     `}
   >
@@ -30,11 +31,12 @@ const NavItem = ({ to, icon: Icon, label, onClick }: NavItemProps) => (
 
 const Sidebar = () => {
   const [isOpen, setIsOpen] = useState(false);
+  const { logout } = useAuth();
 
   return (
     <>
       {/* Mobile Menu Toggle */}
-      <button 
+      <button
         onClick={() => setIsOpen(!isOpen)}
         className="lg:hidden fixed bottom-6 right-6 z-50 w-14 h-14 bg-white text-black rounded-full shadow-2xl flex items-center justify-center hover:scale-110 transition-transform active:scale-95"
       >
@@ -44,7 +46,7 @@ const Sidebar = () => {
       {/* Backdrop for mobile */}
       <AnimatePresence>
         {isOpen && (
-          <motion.div 
+          <motion.div
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
             exit={{ opacity: 0 }}
@@ -64,7 +66,7 @@ const Sidebar = () => {
           </div>
           <span className="font-sans font-bold text-xl tracking-tight">Avighna</span>
         </div>
-        
+
         <nav className="flex flex-col gap-2">
           <NavItem to="/" icon={LayoutDashboard} label="Dashboard" onClick={() => setIsOpen(false)} />
           <NavItem to="/jd-refiner" icon={ClipboardCheck} label="JD Refiner" onClick={() => setIsOpen(false)} />
@@ -74,9 +76,19 @@ const Sidebar = () => {
           <NavItem to="/kpi" icon={BarChart3} label="KPI" onClick={() => setIsOpen(false)} />
           <div className="mt-8 pt-8 border-t border-border flex flex-col gap-2">
             <NavItem to="/settings" icon={Settings} label="Settings" onClick={() => setIsOpen(false)} />
+            <button
+              onClick={() => {
+                logout();
+                setIsOpen(false);
+              }}
+              className="flex items-center gap-3 px-4 py-3 rounded-xl transition-all duration-200 group text-red-400 hover:text-red-300 hover:bg-red-500/10 w-full text-left"
+            >
+              <LogOut size={20} className="transition-transform group-hover:scale-110" />
+              <span className="font-mono text-[12px] uppercase tracking-widest">Logout</span>
+            </button>
           </div>
         </nav>
-        
+
         <div className="mt-auto">
           <div className="p-4 rounded-2xl bg-white/5 border border-border">
             <p className="font-mono text-[10px] text-secondary uppercase mb-2">System Status</p>

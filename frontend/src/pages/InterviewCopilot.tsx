@@ -36,6 +36,11 @@ const InterviewCopilot = () => {
   const chunksRef = useRef<Blob[]>([]);
   const intervalRef = useRef<any>(null);
   const lastSpeakerRef = useRef<'INT' | 'CAN'>('INT');
+  
+  // Dual-Channel Refs
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  const micStreamRef = useRef<MediaStream | null>(null);
+  const sysStreamRef = useRef<MediaStream | null>(null);
 
   useEffect(() => {
     transcriptEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -88,34 +93,75 @@ const InterviewCopilot = () => {
 
   const startCopilot = async () => {
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      setStatus('Requesting Audio Permissions...');
+      // 1. Capture Microphone (Interviewer)
+      const micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      micStreamRef.current = micStream;
+
+      // 2. Capture System/Tab Audio (Candidate)
+      // Using video: true because some browsers require it for getDisplayMedia to prompt
+      const sysStream = await navigator.mediaDevices.getDisplayMedia({ 
+        video: true, 
+        audio: {
+            channelCount: 2,
+            autoGainControl: false,
+            echoCancellation: false,
+            noiseSuppression: false
+        } as any
+      });
+      sysStreamRef.current = sysStream;
+
+      if (!sysStream.getAudioTracks().length) {
+          throw new Error("System Audio not shared. Please check 'Share tab audio' when sharing.");
+      }
+
+      // 3. Setup AudioContext for Merging
+      const ctx = new (window.AudioContext || (window as any).webkitAudioContext)();
+      audioCtxRef.current = ctx;
+
+      const micSource = ctx.createMediaStreamSource(micStream);
+      const sysSource = ctx.createMediaStreamSource(sysStream);
       
-      // 1. Setup Deepgram Nova-2 for Live Real-time Text
+      const merger = ctx.createChannelMerger(2);
+      const dest = ctx.createMediaStreamDestination();
+
+      // Route Mic to Left (Channel 0) -> INT
+      micSource.connect(merger, 0, 0);
+      
+      // Route System Audio to Right (Channel 1) -> CAN
+      sysSource.connect(merger, 0, 1);
+
+      merger.connect(dest);
+
+      // We use the merged stereo stream for recording
+      const mixedStream = dest.stream;
+
+      // 4. Setup Deepgram Nova-2 with Multichannel
       if (DEEPGRAM_KEY) {
-        const socket = new WebSocket('wss://api.deepgram.com/v1/listen?model=nova-2&smart_format=true&diarize=true', [
+        const socket = new WebSocket('wss://api.deepgram.com/v1/listen?model=nova-2&smart_format=true&multichannel=true', [
             'token',
             DEEPGRAM_KEY,
         ]);
 
-        socket.onopen = () => console.log("Deepgram Live Stream Active");
+        socket.onopen = () => console.log("Deepgram Multichannel Active");
         socket.onmessage = (message) => {
             const data = JSON.parse(message.data);
             const transcript = data.channel?.alternatives[0]?.transcript;
             
-            // Extract speaker info from the first word of the segment
-            const speaker = data.channel?.alternatives[0]?.words?.[0]?.speaker;
-            const role = speaker === 1 ? 'CAN' : 'INT'; // Map Speaker 1 to Candidate, Speaker 0 (default) to Interviewer
+            // Channel 0 = Left (Mic/INT), Channel 1 = Right (System/CAN)
+            const channelIndex = data.channel_index?.[0] ?? 0;
+            const role = channelIndex === 1 ? 'CAN' : 'INT';
             lastSpeakerRef.current = role;
 
             if (transcript) {
-                setInterimText(prev => JSON.stringify({ role, text: (typeof prev === 'string' ? '' : JSON.parse(prev).text) + " " + transcript }));
+                setInterimText(JSON.stringify({ role, text: transcript }));
             }
         };
         deepgramSocketRef.current = socket;
       }
 
-      // 2. Setup MediaRecorder for Chunked Whisper Processing
-      const mediaRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm' });
+      // 5. Setup MediaRecorder for the Mixed Stream
+      const mediaRecorder = new MediaRecorder(mixedStream, { mimeType: 'audio/webm' });
       mediaRecorder.ondataavailable = (e) => {
         if (e.data.size > 0) {
             chunksRef.current.push(e.data);
@@ -137,10 +183,9 @@ const InterviewCopilot = () => {
       mediaRecorderRef.current = mediaRecorder;
       isRecordingRef.current = true;
       setIsRecording(true);
-      mediaRecorder.start(250); // Small slices for Deepgram
-      setStatus('Hybrid ASR Active (Deepgram + Whisper)');
+      mediaRecorder.start(250);
+      setStatus('Dual-Channel Active (Mic + System)');
 
-      // 6-second intervals for Whisper accuracy
       intervalRef.current = setInterval(() => {
         if (mediaRecorderRef.current?.state === 'recording') {
           mediaRecorderRef.current.stop();
@@ -150,6 +195,7 @@ const InterviewCopilot = () => {
     } catch (err: any) {
       console.error("Start error", err);
       setStatus(`Error: ${err.message}`);
+      stopCopilot();
     }
   };
 
@@ -159,6 +205,12 @@ const InterviewCopilot = () => {
     if (intervalRef.current) clearInterval(intervalRef.current);
     mediaRecorderRef.current?.stop();
     deepgramSocketRef.current?.close();
+    
+    // Stop tracks
+    micStreamRef.current?.getTracks().forEach(t => t.stop());
+    sysStreamRef.current?.getTracks().forEach(t => t.stop());
+    audioCtxRef.current?.close();
+
     setStatus('Copilot Standby.');
     setInterimText("");
   };
