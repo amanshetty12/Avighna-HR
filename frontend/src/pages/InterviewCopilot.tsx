@@ -35,6 +35,7 @@ const InterviewCopilot = () => {
   const transcriptEndRef = useRef<HTMLDivElement>(null);
   const chunksRef = useRef<Blob[]>([]);
   const intervalRef = useRef<any>(null);
+  const lastSpeakerRef = useRef<'INT' | 'CAN'>('INT');
 
   useEffect(() => {
     transcriptEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -55,7 +56,7 @@ const InterviewCopilot = () => {
       if (goldText && goldText.trim().length > 2) {
         // Clear interim text as we now have "Gold" text for this segment
         setInterimText(""); 
-        setTranscript(prev => [...prev, { role: 'CAN', text: goldText, isFinal: true }]);
+        setTranscript(prev => [...prev, { role: lastSpeakerRef.current, text: goldText, isFinal: true }]);
         
         // Trigger Analysis on the Gold Text
         const extractRes = await axios.post(`${API_BASE}/interview/analyze-stream?text=${encodeURIComponent(goldText)}`);
@@ -91,7 +92,7 @@ const InterviewCopilot = () => {
       
       // 1. Setup Deepgram Nova-2 for Live Real-time Text
       if (DEEPGRAM_KEY) {
-        const socket = new WebSocket('wss://api.deepgram.com/v1/listen?model=nova-2&smart_format=true', [
+        const socket = new WebSocket('wss://api.deepgram.com/v1/listen?model=nova-2&smart_format=true&diarize=true', [
             'token',
             DEEPGRAM_KEY,
         ]);
@@ -100,8 +101,14 @@ const InterviewCopilot = () => {
         socket.onmessage = (message) => {
             const data = JSON.parse(message.data);
             const transcript = data.channel?.alternatives[0]?.transcript;
+            
+            // Extract speaker info from the first word of the segment
+            const speaker = data.channel?.alternatives[0]?.words?.[0]?.speaker;
+            const role = speaker === 1 ? 'CAN' : 'INT'; // Map Speaker 1 to Candidate, Speaker 0 (default) to Interviewer
+            lastSpeakerRef.current = role;
+
             if (transcript) {
-                setInterimText(prev => prev + " " + transcript);
+                setInterimText(prev => JSON.stringify({ role, text: (typeof prev === 'string' ? '' : JSON.parse(prev).text) + " " + transcript }));
             }
         };
         deepgramSocketRef.current = socket;
@@ -202,27 +209,42 @@ const InterviewCopilot = () => {
                   key={i}
                   initial={{ opacity: 0, y: 5 }}
                   animate={{ opacity: 1, y: 0 }}
-                  className="flex justify-end"
+                  className={`flex ${line.role === 'INT' ? 'justify-start' : 'justify-end'}`}
                 >
-                  <div className="max-w-[85%] flex flex-col items-end">
-                    <span className="text-[9px] font-mono uppercase tracking-widest text-accent mb-1 opacity-50">VERIFIED_WHISPER</span>
-                    <div className="p-4 rounded-2xl text-sm leading-relaxed bg-accent/10 border border-accent/20 text-white">
+                  <div className={`max-w-[85%] flex flex-col ${line.role === 'INT' ? 'items-start' : 'items-end'}`}>
+                    <span className={`text-[9px] font-mono uppercase tracking-widest mb-1 opacity-50 ${line.role === 'INT' ? 'text-secondary' : 'text-accent'}`}>
+                       {line.role === 'INT' ? 'INTERVIEWER_VERIFIED' : 'CANDIDATE_VERIFIED'}
+                    </span>
+                    <div className={`p-4 rounded-2xl text-sm leading-relaxed border ${
+                      line.role === 'INT' 
+                        ? 'bg-secondary/10 border-secondary/20 text-white' 
+                        : 'bg-accent/10 border-accent/20 text-white'
+                    }`}>
                       {line.text}
                     </div>
                   </div>
                 </motion.div>
               ))}
 
-              {interimText && (
-                <motion.div className="flex justify-end opacity-60 italic">
-                  <div className="max-w-[85%] flex flex-col items-end">
-                    <span className="text-[9px] font-mono uppercase tracking-widest text-secondary mb-1">NOVA_2_LIVE</span>
-                    <div className="p-4 rounded-2xl text-sm leading-relaxed bg-white/5 border border-white/10 text-white/70">
-                      {interimText}...
-                    </div>
-                  </div>
-                </motion.div>
-              )}
+              {interimText && (() => {
+                try {
+                  const data = JSON.parse(interimText);
+                  return (
+                    <motion.div className={`flex ${data.role === 'INT' ? 'justify-start' : 'end'} opacity-60 italic`}>
+                      <div className={`max-w-[85%] flex flex-col ${data.role === 'INT' ? 'items-start' : 'items-end'}`}>
+                        <span className={`text-[9px] font-mono uppercase tracking-widest mb-1 ${data.role === 'INT' ? 'text-secondary' : 'text-accent'}`}>
+                          {data.role === 'INT' ? 'INT_LIVE' : 'CAN_LIVE'}
+                        </span>
+                        <div className="p-4 rounded-2xl text-sm leading-relaxed bg-white/5 border border-white/10 text-white/70">
+                          {data.text}...
+                        </div>
+                      </div>
+                    </motion.div>
+                  );
+                } catch (e) {
+                  return null;
+                }
+              })()}
               <div ref={transcriptEndRef} />
             </div>
 
