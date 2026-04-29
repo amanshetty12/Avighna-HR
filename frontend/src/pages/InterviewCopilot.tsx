@@ -43,6 +43,10 @@ const InterviewCopilot = () => {
   const micChunksRef = useRef<Blob[]>([]);
   const micIntervalRef = useRef<any>(null);
 
+  // Intelligent analysis buffer + debounce
+  const canBufferRef = useRef<string[]>([]);
+  const analyzeTimerRef = useRef<any>(null);
+
   // System audio refs (virtual mode only)
   const sysStreamRef = useRef<MediaStream | null>(null);
   const sysSocketRef = useRef<WebSocket | null>(null);
@@ -83,6 +87,24 @@ const InterviewCopilot = () => {
     }
   };
 
+  // Debounced analysis: waits for candidate to stop talking, then sends full context
+  const scheduleAnalysis = () => {
+    if (analyzeTimerRef.current) clearTimeout(analyzeTimerRef.current);
+
+    analyzeTimerRef.current = setTimeout(() => {
+      // Sliding window: combine last 5 chunks (~50 sec of speech)
+      const fullContext = canBufferRef.current.slice(-5).join(' ');
+      console.log(`[BUFFER ANALYZE] Sending ${canBufferRef.current.length} chunks: "${fullContext.slice(0, 100)}..."`);
+
+      if (fullContext.trim().length > 10) {
+        analyzeText(fullContext);
+      }
+
+      // Keep last 2 chunks as overlap context for next analysis
+      canBufferRef.current = canBufferRef.current.slice(-2);
+    }, 3500); // 3.5 sec after candidate stops speaking
+  };
+
   // Whisper "Gold Standard" processing - runs on audio chunks for accurate final transcript
   const processWhisperChunk = async (audioBlob: Blob, role: 'INT' | 'CAN') => {
     if (audioBlob.size < 1000) return; 
@@ -100,8 +122,12 @@ const InterviewCopilot = () => {
         setTranscript(prev => [...prev, { role, text: goldText, isFinal: true }]);
         console.log(`[WHISPER FINAL] ${role}: ${goldText}`);
         
-        // Trigger Entity Extraction on accurate Whisper text
-        analyzeText(goldText);
+        // Buffer CAN text and debounce analysis for intelligent matching
+        if (role === 'CAN') {
+          canBufferRef.current.push(goldText);
+          console.log(`[BUFFER] Added CAN chunk. Buffer size: ${canBufferRef.current.length}`);
+          scheduleAnalysis();
+        }
       }
     } catch (e) {
       console.error("Whisper error", e);
@@ -238,7 +264,7 @@ const InterviewCopilot = () => {
     micWhisper.start();
     micIntervalRef.current = setInterval(() => {
       if (micWhisper.state === 'recording') micWhisper.stop();
-    }, 6000);
+    }, 10000);
 
     // System Audio Whisper (CAN)
     const sysWhisper = new MediaRecorder(sysAudioOnly, { mimeType: 'audio/webm' });
@@ -254,7 +280,7 @@ const InterviewCopilot = () => {
     sysWhisper.start();
     sysIntervalRef.current = setInterval(() => {
       if (sysWhisper.state === 'recording') sysWhisper.stop();
-    }, 6000);
+    }, 10000);
 
     setStatus('Dual-Socket Active (Deepgram Live + Whisper Verified)');
   };
@@ -319,6 +345,8 @@ const InterviewCopilot = () => {
     setIsRecording(false);
     if (micIntervalRef.current) clearInterval(micIntervalRef.current);
     if (sysIntervalRef.current) clearInterval(sysIntervalRef.current);
+    if (analyzeTimerRef.current) clearTimeout(analyzeTimerRef.current);
+    canBufferRef.current = [];
     
     // Stop recorders
     micRecorderRef.current?.stop();
